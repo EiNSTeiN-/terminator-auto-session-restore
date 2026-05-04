@@ -90,6 +90,7 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         self._window_handlers = {}
         self._previous_signal_handlers = {}
         self._cwd_by_pane = {}
+        self._restore_argv_by_pane = {}
         self._last_saved_signature = None
         self._last_save_at = 0
         self._last_transcript_checkpoint_at = 0
@@ -194,6 +195,10 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
 
     def _connect_window(self, window):
         handlers = self._window_handlers.setdefault(window, {})
+        if "delete-event" not in handlers:
+            handlers["delete-event"] = window.connect(
+                "delete-event", self._save_on_window_delete
+            )
         for signal_name in ("configure-event", "window-state-event"):
             if signal_name not in handlers:
                 handlers[signal_name] = window.connect(
@@ -267,6 +272,14 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         )
         return True
 
+    def _save_on_window_delete(self, _window, _event):
+        terminal_count = self._terminal_count()
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
+        )
+        self._mark_window_close_snapshot(terminal_count)
+        return False
+
     def _save_on_pre_close(self, _terminal, *_args):
         terminal_count = self._terminal_count()
         if self._should_skip_degraded_close_save(terminal_count):
@@ -276,12 +289,7 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
         )
         if terminal_count > 1:
-            self._window_close_snapshot_terminal_count = max(
-                self._window_close_snapshot_terminal_count, terminal_count
-            )
-            self._ignore_degraded_close_saves_until = (
-                time.monotonic() + WINDOW_CLOSE_SUPPRESS_SECONDS
-            )
+            self._mark_window_close_snapshot(terminal_count)
 
     def _save_on_close_term(self, _terminal, *_args):
         if self._should_skip_degraded_close_save():
@@ -299,6 +307,16 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
 
     def _terminal_count(self):
         return len(Terminator().terminals)
+
+    def _mark_window_close_snapshot(self, terminal_count):
+        if terminal_count <= 1:
+            return
+        self._window_close_snapshot_terminal_count = max(
+            self._window_close_snapshot_terminal_count, terminal_count
+        )
+        self._ignore_degraded_close_saves_until = (
+            time.monotonic() + WINDOW_CLOSE_SUPPRESS_SECONDS
+        )
 
     def _should_skip_degraded_close_save(self, terminal_count=None):
         now = time.monotonic()
@@ -393,7 +411,9 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
                 continue
 
             pane_id = str(item.get("uuid"))
-            restore_argv = self._find_resume_argv(terminal, include_scrollback_resume)
+            restore_argv = self._find_resume_argv(
+                pane_id, terminal, include_scrollback_resume
+            )
             cwd = self._write_pane_state(
                 pane_id, terminal, restore_argv, capture_mode
             )
@@ -676,12 +696,20 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             return cwd
         return os.path.expanduser("~")
 
-    def _find_resume_argv(self, terminal, include_scrollback):
+    def _find_resume_argv(self, pane_id, terminal, include_scrollback):
         if include_scrollback:
             restore_argv = self._find_resume_argv_in_scrollback(terminal)
             if restore_argv:
+                self._restore_argv_by_pane[pane_id] = restore_argv
                 return restore_argv
-        return self._find_resume_argv_from_process_tree(terminal)
+        restore_argv = self._find_resume_argv_from_process_tree(terminal)
+        if restore_argv:
+            self._restore_argv_by_pane[pane_id] = restore_argv
+            return restore_argv
+        if not include_scrollback:
+            self._restore_argv_by_pane.pop(pane_id, None)
+            return None
+        return self._restore_argv_by_pane.get(pane_id)
 
     def _find_resume_argv_in_scrollback(self, terminal):
         try:
@@ -776,6 +804,10 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         if session_id:
             return session_id
 
+        session_id = self._extract_codex_session_id_from_open_files(process)
+        if session_id:
+            return session_id
+
         session_id = self._extract_codex_session_id_from_cmdline(process)
         if session_id:
             return session_id
@@ -801,6 +833,21 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             value = environ.get(key)
             if value and UUID_RE.search(value):
                 return UUID_RE.search(value).group(0)
+        return None
+
+    def _extract_codex_session_id_from_open_files(self, process):
+        try:
+            open_files = process.open_files()
+        except psutil.Error:
+            return None
+
+        for open_file in open_files:
+            path = getattr(open_file, "path", "")
+            if "/.codex/sessions/" not in path or not path.endswith(".jsonl"):
+                continue
+            session_id = self._codex_session_id_from_path(path)
+            if session_id:
+                return session_id
         return None
 
     def _extract_codex_session_id_from_cmdline(self, process):
@@ -829,11 +876,9 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         return None
 
     def _codex_session_id_from_file(self, path, cwd):
-        filename = os.path.basename(path)
-        match = UUID_RE.search(filename)
-        if not match:
+        session_id = self._codex_session_id_from_path(path)
+        if not session_id:
             return None
-        session_id = match.group(0)
 
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -848,6 +893,13 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         if payload.get("id") and payload.get("id") != session_id:
             return None
         return session_id
+
+    def _codex_session_id_from_path(self, path):
+        filename = os.path.basename(path)
+        match = UUID_RE.search(filename)
+        if match:
+            return match.group(0)
+        return None
 
     def _find_recent_claude_session_id(self, cwd, started_at):
         if not cwd:
