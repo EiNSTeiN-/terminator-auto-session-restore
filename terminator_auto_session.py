@@ -35,11 +35,15 @@ AVAILABLE = ["TerminatorAutoSessionRestore"]
 
 LAYOUT_NAME = "TerminatorAutoSessionRestore"
 SAVE_INTERVAL_SECONDS = 20
+TRANSCRIPT_CHECKPOINT_INTERVAL_SECONDS = 60
 CONNECT_INTERVAL_SECONDS = 2
-LAYOUT_CHANGE_SAVE_DELAY_MS = 250
+LAYOUT_CHANGE_SAVE_DELAY_MS = 1000
 WINDOW_CLOSE_SUPPRESS_SECONDS = 2
 MIN_RESTORED_WINDOW_WIDTH = 100
 MIN_RESTORED_WINDOW_HEIGHT = 80
+CAPTURE_NONE = "none"
+CAPTURE_TEXT = "text"
+CAPTURE_FULL = "full"
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
     "terminator-auto-session",
@@ -88,6 +92,7 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         self._cwd_by_pane = {}
         self._last_saved_signature = None
         self._last_save_at = 0
+        self._last_transcript_checkpoint_at = 0
         self._layout_change_save_id = None
         self._ignore_degraded_close_saves_until = 0
         self._window_close_snapshot_terminal_count = 0
@@ -237,7 +242,9 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             signal.signal(signum, self._handle_termination_signal)
 
     def _handle_termination_signal(self, signum, frame):
-        self.save_session_layout(force=True)
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
+        )
 
         previous = self._previous_signal_handlers.get(signum, signal.SIG_DFL)
         if callable(previous):
@@ -251,7 +258,13 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
 
     def _periodic_save(self):
         self._connect_signals()
-        self.save_session_layout()
+        now = time.monotonic()
+        capture_mode = CAPTURE_NONE
+        if now - self._last_transcript_checkpoint_at >= TRANSCRIPT_CHECKPOINT_INTERVAL_SECONDS:
+            capture_mode = CAPTURE_TEXT
+        self.save_session_layout(
+            capture_mode=capture_mode, include_scrollback_resume=False
+        )
         return True
 
     def _save_on_pre_close(self, _terminal, *_args):
@@ -259,7 +272,9 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         if self._should_skip_degraded_close_save(terminal_count):
             return
 
-        self.save_session_layout(force=True)
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
+        )
         if terminal_count > 1:
             self._window_close_snapshot_terminal_count = max(
                 self._window_close_snapshot_terminal_count, terminal_count
@@ -271,12 +286,16 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
     def _save_on_close_term(self, _terminal, *_args):
         if self._should_skip_degraded_close_save():
             return
-        self.save_session_layout(force=True)
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
+        )
 
     def _save_on_child_exit(self, _vte_terminal, _status):
         if self._should_skip_degraded_close_save():
             return
-        self.save_session_layout(force=True)
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
+        )
 
     def _terminal_count(self):
         return len(Terminator().terminals)
@@ -301,11 +320,15 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
     def _deferred_layout_change_save(self):
         self._layout_change_save_id = None
         self._connect_signals()
-        self.save_session_layout(force=True)
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_NONE, include_scrollback_resume=False
+        )
         return False
 
     def _save_from_menu(self, _menuitem):
-        self.save_session_layout(force=True)
+        self.save_session_layout(
+            force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
+        )
 
     def _clear_from_menu(self, _menuitem):
         config = Config()
@@ -313,24 +336,35 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         config.save()
         self._last_saved_signature = None
 
-    def save_session_layout(self, force=False):
+    def save_session_layout(
+        self, force=False, capture_mode=CAPTURE_NONE, include_scrollback_resume=False
+    ):
         terminator = Terminator()
         if terminator.doing_layout:
             return True
 
         now = time.monotonic()
-        if not force and now - self._last_save_at < SAVE_INTERVAL_SECONDS:
+        if (
+            not force
+            and capture_mode == CAPTURE_NONE
+            and now - self._last_save_at < SAVE_INTERVAL_SECONDS
+        ):
             return True
 
         try:
             current_layout = self._normalise_layout_for_config(
                 terminator.describe_layout(save_cwd=False)
             )
-            self._add_restore_state(current_layout)
+            self._add_restore_state(
+                current_layout, capture_mode, include_scrollback_resume
+            )
             self._apply_window_geometry_safety(current_layout)
             current_layout = self._normalise_layout_for_config(current_layout)
             signature = repr(current_layout)
             if not force and signature == self._last_saved_signature:
+                self._last_save_at = now
+                if capture_mode != CAPTURE_NONE:
+                    self._last_transcript_checkpoint_at = now
                 return True
 
             config = Config()
@@ -339,12 +373,14 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             config.save()
             self._last_saved_signature = signature
             self._last_save_at = now
+            if capture_mode != CAPTURE_NONE:
+                self._last_transcript_checkpoint_at = now
             dbg("%s saved layout" % LAYOUT_NAME)
         except Exception as ex:
             err("%s failed to save layout: %s" % (LAYOUT_NAME, ex))
         return True
 
-    def _add_restore_state(self, layout):
+    def _add_restore_state(self, layout, capture_mode, include_scrollback_resume):
         terminals_by_uuid = {
             str(terminal.uuid): terminal for terminal in Terminator().terminals
         }
@@ -357,8 +393,10 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
                 continue
 
             pane_id = str(item.get("uuid"))
-            restore_argv = self._find_resume_argv(terminal)
-            cwd = self._write_pane_state(pane_id, terminal, restore_argv)
+            restore_argv = self._find_resume_argv(terminal, include_scrollback_resume)
+            cwd = self._write_pane_state(
+                pane_id, terminal, restore_argv, capture_mode
+            )
             item["directory"] = cwd
             item["command"] = "%s %s" % (
                 shlex.quote(PANE_RESTORE_HELPER),
@@ -526,17 +564,19 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             return None
         return max(scored_areas)[2]
 
-    def _write_pane_state(self, pane_id, terminal, restore_argv):
+    def _write_pane_state(self, pane_id, terminal, restore_argv, capture_mode):
         os.makedirs(STATE_DIR, exist_ok=True)
-        transcript, html_transcript = self._capture_scrollback(terminal)
         transcript_path = os.path.join(STATE_DIR, "%s.txt" % pane_id)
         html_transcript_path = os.path.join(STATE_DIR, "%s.html" % pane_id)
         metadata_path = os.path.join(STATE_DIR, "%s.json" % pane_id)
 
-        if transcript is not None:
-            self._write_text_atomic(transcript_path, transcript)
-        if html_transcript is not None:
-            self._write_text_atomic(html_transcript_path, html_transcript)
+        html_transcript = None
+        if capture_mode != CAPTURE_NONE:
+            transcript, html_transcript = self._capture_scrollback(terminal, capture_mode)
+            if transcript is not None:
+                self._write_text_atomic(transcript_path, transcript)
+            if html_transcript is not None:
+                self._write_text_atomic(html_transcript_path, html_transcript)
 
         cwd = self._get_terminal_cwd(pane_id, terminal)
         metadata = {
@@ -546,7 +586,9 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             "restore_argv": restore_argv,
             "transcript_path": transcript_path,
         }
-        if html_transcript is not None:
+        if self._should_use_html_transcript(
+            html_transcript_path, transcript_path, capture_mode, html_transcript
+        ):
             metadata["html_transcript_path"] = html_transcript_path
         self._write_text_atomic(
             metadata_path, json.dumps(metadata, indent=2, sort_keys=True) + "\n"
@@ -559,7 +601,21 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             handle.write(content)
         os.replace(tmp_path, path)
 
-    def _capture_scrollback(self, terminal):
+    def _should_use_html_transcript(
+        self, html_transcript_path, transcript_path, capture_mode, html_transcript
+    ):
+        if html_transcript is not None:
+            return True
+        if capture_mode != CAPTURE_NONE:
+            return False
+        try:
+            return os.path.getmtime(html_transcript_path) >= os.path.getmtime(
+                transcript_path
+            )
+        except OSError:
+            return False
+
+    def _capture_scrollback(self, terminal, capture_mode):
         try:
             vte_terminal = terminal.get_vte()
             col, row = vte_terminal.get_cursor_position()
@@ -574,7 +630,7 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
                     Vte.Format.TEXT, row_start, 0, row_end, col
                 )[0]
             html = None
-            if Vte.get_minor_version() >= 72:
+            if capture_mode == CAPTURE_FULL and Vte.get_minor_version() >= 72:
                 try:
                     html = vte_terminal.get_text_range_format(
                         Vte.Format.HTML, row_start, 0, row_end, col
@@ -620,11 +676,12 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             return cwd
         return os.path.expanduser("~")
 
-    def _find_resume_argv(self, terminal):
-        return (
-            self._find_resume_argv_in_scrollback(terminal)
-            or self._find_resume_argv_from_process_tree(terminal)
-        )
+    def _find_resume_argv(self, terminal, include_scrollback):
+        if include_scrollback:
+            restore_argv = self._find_resume_argv_in_scrollback(terminal)
+            if restore_argv:
+                return restore_argv
+        return self._find_resume_argv_from_process_tree(terminal)
 
     def _find_resume_argv_in_scrollback(self, terminal):
         try:

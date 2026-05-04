@@ -113,6 +113,26 @@ Terminator close, the plugin tries to derive the exact session ID from their
 process environment and local session files. The restore helper validates exact
 Codex and Claude session IDs against local session files before running them.
 
+## Crash Recovery
+
+Normal Terminator closes capture the latest styled transcript before the pane
+exits. For crash recovery, the plugin also checkpoints lightweight state while
+Terminator is running:
+
+- Layout, pane working directories, and Codex/Claude process-derived resume
+  commands are refreshed periodically.
+- Plaintext transcript checkpoints are captured periodically for the full
+  available terminal scrollback, so the plugin does not intentionally truncate
+  saved transcript state.
+- Styled HTML transcript capture is reserved for clean close, child exit,
+  termination signal, or manual `Save Auto Session Now`, because HTML capture is
+  the expensive path most likely to make typing feel sluggish.
+
+After a hard power loss, the latest checkpoint may be behind by one interval
+and the operating system may still lose very recent filesystem writes. The
+design is therefore best-effort crash recovery, not a transactional terminal
+recorder.
+
 ## Shell History
 
 The transcript restore is independent of shell history. It shows previous
