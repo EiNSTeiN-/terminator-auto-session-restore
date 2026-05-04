@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from configobj import ConfigObj
@@ -53,32 +54,49 @@ def ensure_plugin_enabled(config_path: Path) -> None:
     config.write()
 
 
-def write_desktop_file(dest: Path, wrapper: Path) -> None:
+def desktop_file_lines(name: str, comment: str, wrapper: Path) -> list[str]:
+    return [
+        "[Desktop Entry]",
+        "Version=1.0",
+        f"Name={name}",
+        f"Comment={comment}",
+        "TryExec=/usr/bin/terminator",
+        f"Exec={wrapper}",
+        "Icon=terminator",
+        "Type=Application",
+        "Terminal=false",
+        "DBusActivatable=false",
+        "Categories=GTK;System;TerminalEmulator;",
+        "StartupNotify=true",
+        "StartupWMClass=terminator",
+        "X-Ubuntu-Gettext-Domain=terminator",
+        "Actions=NewWindow;",
+        "Keywords=terminal;shell;prompt;command;commandline;restore;session;",
+        "",
+        "[Desktop Action NewWindow]",
+        "Name=Open a New Window",
+        f"Exec={wrapper}",
+        "",
+    ]
+
+
+def write_desktop_file(dest: Path, wrapper: Path, name: str, comment: str) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(
-        "\n".join(
-            [
-                "[Desktop Entry]",
-                "Name=Terminator",
-                "Comment=Multiple terminals in one window",
-                "TryExec=/usr/bin/terminator",
-                f"Exec={wrapper}",
-                "Icon=terminator",
-                "Type=Application",
-                "Categories=GNOME;GTK;Utility;TerminalEmulator;System;",
-                "StartupNotify=true",
-                "X-Ubuntu-Gettext-Domain=terminator",
-                "X-Ayatana-Desktop-Shortcuts=NewWindow;",
-                "Keywords=terminal;shell;prompt;command;commandline;",
-                "",
-                "[NewWindow Shortcut Group]",
-                "Name=Open a New Window",
-                f"Exec={wrapper}",
-                "TargetEnvironment=Unity",
-                "",
-            ]
-        ),
+        "\n".join(desktop_file_lines(name, comment, wrapper)),
         encoding="utf-8",
+    )
+
+
+def refresh_desktop_database(applications_dir: Path) -> None:
+    updater = shutil.which("update-desktop-database")
+    if updater is None:
+        return
+    subprocess.run(
+        [updater, str(applications_dir)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -91,18 +109,34 @@ def main() -> None:
     wrapper_dest = home / ".local" / "bin" / "terminator-auto-restore"
     pane_restore_dest = home / ".local" / "bin" / "terminator-pane-restore"
     desktop_dest = home / ".local" / "share" / "applications" / "terminator.desktop"
+    auto_restore_desktop_dest = (
+        home / ".local" / "share" / "applications" / "terminator-auto-restore.desktop"
+    )
     config_path = config_home / "terminator" / "config"
 
     install_file(source_dir / "terminator_auto_session.py", plugin_dest, 0o644)
     install_file(source_dir / "terminator-auto-restore", wrapper_dest, 0o755)
     install_file(source_dir / "terminator-pane-restore", pane_restore_dest, 0o755)
     ensure_plugin_enabled(config_path)
-    write_desktop_file(desktop_dest, wrapper_dest)
+    write_desktop_file(
+        desktop_dest,
+        wrapper_dest,
+        "Terminator",
+        "Multiple terminals in one window",
+    )
+    write_desktop_file(
+        auto_restore_desktop_dest,
+        wrapper_dest,
+        "Terminator Auto Restore",
+        "Restore saved Terminator windows, panes, and transcripts",
+    )
+    refresh_desktop_database(desktop_dest.parent)
 
     print(f"Installed plugin: {plugin_dest}")
     print(f"Installed launcher: {wrapper_dest}")
     print(f"Installed pane restore helper: {pane_restore_dest}")
     print(f"Installed desktop override: {desktop_dest}")
+    print(f"Installed app-grid launcher: {auto_restore_desktop_dest}")
     print(f"Enabled plugin: {PLUGIN_NAME}")
 
 

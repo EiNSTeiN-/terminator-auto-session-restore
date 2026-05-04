@@ -16,10 +16,11 @@ The plugin does not require patching Terminator or replacing the Ubuntu
 - Pane working directories.
 - The visible VTE scrollback transcript for each pane.
 - A fresh login shell after the transcript is replayed.
-- Codex sessions when a `codex resume ...` command or Codex session ID is
-  detectable.
-- Claude Code sessions when a `claude --resume ...`, `claude -r ...`, or
-  `claude --continue` restore target is detectable.
+- Codex sessions when a `codex resume <session-id>` line or Codex session ID is
+  detectable from the running Codex process or local Codex session files.
+- Claude Code sessions when a `claude --resume <session-id>`,
+  `claude -r <session-id>`, or Claude session ID is detectable from the running
+  Claude process or local Claude project files.
 
 ## Fresh Ubuntu Install
 
@@ -47,6 +48,14 @@ The installer creates a user desktop override at:
 ```
 
 That override makes normal desktop launches call `terminator-auto-restore`.
+It also creates a separate GNOME app-grid launcher:
+
+```text
+~/.local/share/applications/terminator-auto-restore.desktop
+```
+
+Search for `Terminator Auto Restore` in GNOME Shell if you want a distinct
+launcher that can be pinned separately from the stock Terminator entry.
 
 ## How It Works
 
@@ -88,8 +97,21 @@ Each restored pane runs:
 ~/.local/bin/terminator-pane-restore <pane-id>
 ```
 
-That helper prints the saved transcript, runs a detected app-specific resume
-command when one exists, and finally starts a fresh login shell.
+That helper prints the saved transcript, draws a separator showing when the
+pane was saved, runs a detected app-specific resume command when one exists,
+and finally starts a fresh login shell. On VTE versions that support styled
+HTML capture, new saves also replay foreground/background colors by converting
+the saved HTML transcript back to ANSI color sequences.
+
+Saved layouts include window size and position. When saving, off-screen window
+geometry is adjusted to the current monitor work area so a restored Terminator
+window does not come back outside the visible viewport.
+
+Codex and Claude restore does not depend on those tools exiting cleanly and
+printing their final resume hints. When they are still running during a
+Terminator close, the plugin tries to derive the exact session ID from their
+process environment and local session files. The restore helper validates exact
+Codex and Claude session IDs against local session files before running them.
 
 ## Shell History
 
@@ -97,8 +119,19 @@ The transcript restore is independent of shell history. It shows previous
 commands and command output in the terminal pane even if your shell did not
 flush history before reboot.
 
-For normal shell history files, configure your shell to append history
-frequently.
+For restored Bash panes, `terminator-pane-restore` assigns a pane-specific
+history file under:
+
+```text
+~/.local/state/terminator-auto-session/shell-history/
+```
+
+It starts Bash with a generated rcfile that sources your normal `~/.bashrc`,
+then forces `HISTFILE` to the pane-specific file and appends/refreshes history
+on each prompt. That keeps arrow-up history separate per restored pane.
+
+For non-restored shells, or shells other than Bash, configure your shell to
+append history frequently.
 
 For Bash, add or keep settings like these in `~/.bashrc`:
 
@@ -121,9 +154,10 @@ setopt SHARE_HISTORY
 
 ## Privacy
 
-Saved transcripts are plaintext. If your terminal shows secrets, tokens,
-passwords, private source code, or production data, those bytes may be written
-under:
+Saved transcripts and pane-specific Bash history files are plaintext, with
+styled HTML transcript copies on VTE versions that support color capture. If
+your terminal shows secrets, tokens, passwords, private source code, or
+production data, those bytes may be written under:
 
 ```text
 ~/.local/state/terminator-auto-session/
@@ -146,10 +180,36 @@ Install or update the plugin:
 python3 install.py
 ```
 
+The installer also writes a user-level desktop override at:
+
+```text
+~/.local/share/applications/terminator.desktop
+```
+
+and a separate app-grid launcher at:
+
+```text
+~/.local/share/applications/terminator-auto-restore.desktop
+```
+
+That desktop entry launches `~/.local/bin/terminator-auto-restore`, so the
+GNOME dock and app grid can use auto-restore without you typing the wrapper
+command manually. The separate entry appears as `Terminator Auto Restore` and
+can be pinned independently. If the dock still launches the old system
+Terminator entry after install, fully close Terminator and log out/in, or unpin
+and re-pin Terminator so GNOME refreshes its launcher cache.
+
 Launch without auto-restore:
 
 ```bash
 TERMINATOR_NO_AUTO_RESTORE=1 ~/.local/bin/terminator-auto-restore
+```
+
+Force the saved layout in a separate no-DBus Terminator process, even while
+another Terminator process is already running:
+
+```bash
+TERMINATOR_FORCE_AUTO_RESTORE=1 ~/.local/bin/terminator-auto-restore
 ```
 
 Force the saved layout:

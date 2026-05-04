@@ -45,6 +45,13 @@ def main() -> None:
     remove(home / ".local" / "bin" / "terminator-auto-restore")
     remove(home / ".local" / "bin" / "terminator-pane-restore")
     remove(home / ".local" / "share" / "applications" / "terminator.desktop")
+    remove(
+        home
+        / ".local"
+        / "share"
+        / "applications"
+        / "terminator-auto-restore.desktop"
+    )
     disable_plugin(config_home / "terminator" / "config")
 
     state_dir = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / (

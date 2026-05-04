@@ -5,15 +5,76 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
+import shutil
 import subprocess
 import sys
+from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+
+
+SEPARATOR_FALLBACK_LABEL = " previous shell ended; live shell below "
+ANSI_RESET = "\033[0m"
+ANSI_PATTERN = re.compile(r"\033\[[0-9;]*m")
+RGB_PATTERN = re.compile(r"rgba?\(([^)]+)\)")
+UUID_PATTERN = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+UUID_RE = re.compile(r"\b%s\b" % UUID_PATTERN)
+CODEX_RESUME_RE = re.compile(r"\bcodex\s+resume\s+(?P<session_id>%s)\b" % UUID_PATTERN)
+CLAUDE_RESUME_RE = re.compile(
+    r"\bclaude\s+(?:--resume|-r)\s+(?P<session_id>%s)\b" % UUID_PATTERN
+)
+SHELL_HISTORY_DIRNAME = "shell-history"
+BASH_HISTORY_RCDIR = "bash-rc"
+
+
+HTML_COLOR_NAMES = {
+    "black": (0, 0, 0),
+    "red": (255, 0, 0),
+    "green": (0, 128, 0),
+    "yellow": (255, 255, 0),
+    "blue": (0, 0, 255),
+    "magenta": (255, 0, 255),
+    "cyan": (0, 255, 255),
+    "white": (255, 255, 255),
+    "gray": (128, 128, 128),
+    "grey": (128, 128, 128),
+}
 
 
 def state_dir() -> Path:
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / (
         "terminator-auto-session"
     )
+
+
+def shell_history_dir() -> Path:
+    return state_dir() / SHELL_HISTORY_DIRNAME
+
+
+def pane_history_path(pane_id: str) -> Path | None:
+    if not pane_id or not UUID_RE.fullmatch(pane_id):
+        return None
+    return shell_history_dir() / f"{pane_id}.history"
+
+
+def configure_shell_history_env(pane_id: str) -> Path | None:
+    history_path = pane_history_path(pane_id)
+    if history_path is None:
+        return None
+
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.touch(mode=0o600, exist_ok=True)
+    history_path.chmod(0o600)
+
+    os.environ["TERMINATOR_AUTO_SESSION_PANE_ID"] = pane_id
+    os.environ["TERMINATOR_AUTO_SESSION_HISTFILE"] = str(history_path)
+    os.environ["HISTFILE"] = str(history_path)
+    return history_path
 
 
 def load_metadata(pane_id: str) -> dict:
@@ -27,31 +88,363 @@ def load_metadata(pane_id: str) -> dict:
         return {}
 
 
-def replay_transcript(pane_id: str, metadata: dict) -> None:
-    transcript_path = Path(
-        metadata.get("transcript_path") or state_dir() / f"{pane_id}.txt"
+def transcript_path_from_metadata(pane_id: str, metadata: dict, key: str, suffix: str) -> Path:
+    return Path(metadata.get(key) or state_dir() / f"{pane_id}.{suffix}")
+
+
+def replay_transcript(pane_id: str, metadata: dict) -> tuple[bool, bool]:
+    html_transcript_path = transcript_path_from_metadata(
+        pane_id, metadata, "html_transcript_path", "html"
     )
+    try:
+        html_transcript = html_transcript_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except FileNotFoundError:
+        html_transcript = ""
+    if html_transcript:
+        transcript = html_to_ansi(html_transcript)
+        if transcript:
+            sys.stdout.write(transcript)
+            sys.stdout.flush()
+            return True, transcript.endswith("\n")
+
+    transcript_path = transcript_path_from_metadata(
+        pane_id, metadata, "transcript_path", "txt"
+    )
+    wrote_transcript = False
+    ended_with_newline = True
     try:
         with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), ""):
+                wrote_transcript = True
+                ended_with_newline = chunk.endswith("\n")
                 sys.stdout.write(chunk)
         sys.stdout.flush()
     except FileNotFoundError:
-        return
+        return False, True
+    return wrote_transcript, ended_with_newline
 
 
-def run_restore_command(metadata: dict) -> None:
+def css_color_to_rgb(value: str) -> tuple[int, int, int] | None:
+    value = value.strip().lower()
+    value = value.split("!", 1)[0].strip()
+    if value in ("", "inherit", "initial", "none", "transparent"):
+        return None
+    if value in HTML_COLOR_NAMES:
+        return HTML_COLOR_NAMES[value]
+    if value.startswith("#"):
+        color = value[1:]
+        if len(color) == 3:
+            color = "".join(part * 2 for part in color)
+        if len(color) == 6:
+            try:
+                return tuple(int(color[index : index + 2], 16) for index in (0, 2, 4))
+            except ValueError:
+                return None
+
+    match = RGB_PATTERN.match(value)
+    if match:
+        parts = [part.strip() for part in match.group(1).split(",")]
+        if len(parts) >= 3:
+            try:
+                return tuple(max(0, min(255, int(float(part)))) for part in parts[:3])
+            except ValueError:
+                return None
+    return None
+
+
+def sgr_for_style(style: str) -> list[str]:
+    sgr: list[str] = []
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        name, value = [part.strip().lower() for part in declaration.split(":", 1)]
+        if name == "color":
+            color = css_color_to_rgb(value)
+            if color:
+                sgr.append("38;2;%d;%d;%d" % color)
+        elif name in ("background", "background-color"):
+            color = css_color_to_rgb(value)
+            if color:
+                sgr.append("48;2;%d;%d;%d" % color)
+        elif name == "font-weight" and (value == "bold" or value.isdigit() and int(value) >= 600):
+            sgr.append("1")
+        elif name == "font-style" and value == "italic":
+            sgr.append("3")
+        elif name == "text-decoration" and "underline" in value:
+            sgr.append("4")
+    return sgr
+
+
+class VteHtmlToAnsiParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.style_stack: list[list[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr_map = {name.lower(): value or "" for name, value in attrs}
+        if tag == "br":
+            self.parts.append("\n")
+            return
+        if tag not in ("font", "span", "b", "strong", "i", "em", "u"):
+            return
+
+        sgr: list[str] = []
+        if tag in ("b", "strong"):
+            sgr.append("1")
+        elif tag in ("i", "em"):
+            sgr.append("3")
+        elif tag == "u":
+            sgr.append("4")
+        sgr.extend(sgr_for_style(attr_map.get("style", "")))
+        if tag == "font":
+            color = css_color_to_rgb(attr_map.get("color", ""))
+            if color:
+                sgr.append("38;2;%d;%d;%d" % color)
+            bgcolor = css_color_to_rgb(attr_map.get("bgcolor", ""))
+            if bgcolor:
+                sgr.append("48;2;%d;%d;%d" % bgcolor)
+
+        self.style_stack.append(sgr)
+        if sgr:
+            self.parts.append("\033[%sm" % ";".join(sgr))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() not in ("font", "span", "b", "strong", "i", "em", "u"):
+            return
+        if self.style_stack:
+            self.style_stack.pop()
+        self.parts.append(ANSI_RESET)
+        for sgr in self.style_stack:
+            if sgr:
+                self.parts.append("\033[%sm" % ";".join(sgr))
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def html_to_ansi(html: str) -> str:
+    parser = VteHtmlToAnsiParser()
+    parser.feed(html)
+    parser.close()
+    transcript = "".join(parser.parts)
+    if ANSI_PATTERN.search(transcript) and not transcript.endswith(ANSI_RESET):
+        transcript += ANSI_RESET
+    return transcript
+
+
+def previous_shell_end_label(metadata: dict, columns: int) -> str:
+    saved_at = metadata.get("saved_at")
+    if isinstance(saved_at, (int, float)):
+        ended = datetime.fromtimestamp(saved_at)
+    else:
+        try:
+            ended = datetime.fromtimestamp(float(saved_at))
+        except (TypeError, ValueError):
+            return SEPARATOR_FALLBACK_LABEL
+
+    full_label = " previous shell ended %s; live shell below " % ended.strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    if columns >= len(full_label) + 4:
+        return full_label
+
+    short_label = " previous shell ended %s " % ended.strftime("%H:%M:%S")
+    if columns >= len(short_label) + 4:
+        return short_label
+    return " previous shell ended "
+
+
+def print_live_shell_separator(transcript_ended_with_newline: bool, metadata: dict) -> None:
+    if not transcript_ended_with_newline:
+        sys.stdout.write("\n")
+
+    columns = shutil.get_terminal_size((80, 24)).columns
+    label = previous_shell_end_label(metadata, columns)
+
+    width = max(columns, len(label))
+    fill = width - len(label)
+    line = "-" * (fill // 2) + label + "-" * (fill - fill // 2)
+
+    if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+        line = f"\033[2m{line}\033[0m"
+    sys.stdout.write(f"{line}\n")
+    sys.stdout.flush()
+
+
+def valid_restore_argv(restore_argv: object) -> bool:
+    return isinstance(restore_argv, list) and all(
+        isinstance(part, str) for part in restore_argv
+    )
+
+
+def restore_argv_session_id(restore_argv: list[str]) -> str | None:
+    if len(restore_argv) < 3:
+        return None
+    session_id = restore_argv[-1]
+    if UUID_RE.fullmatch(session_id):
+        return session_id
+    return None
+
+
+def restore_argv_has_specific_session(pane_id: str, restore_argv: object) -> bool:
+    if not valid_restore_argv(restore_argv) or len(restore_argv) < 3:
+        return False
+
+    session_id = restore_argv_session_id(restore_argv)
+    if session_id is None:
+        return False
+    if pane_id and session_id == pane_id:
+        return False
+
+    return restore_argv[:2] == ["codex", "resume"] or (
+        restore_argv[0] == "claude" and restore_argv[1] in ("--resume", "-r")
+    )
+
+
+def restore_argv_session_available(restore_argv: list[str], metadata: dict) -> bool:
+    session_id = restore_argv_session_id(restore_argv)
+    if session_id is None:
+        return False
+
+    if restore_argv[:2] == ["codex", "resume"]:
+        return codex_session_exists(session_id)
+    if restore_argv[0] == "claude" and restore_argv[1] in ("--resume", "-r"):
+        return claude_session_exists(session_id, metadata.get("cwd"))
+    return False
+
+
+def codex_session_exists(session_id: str) -> bool:
+    base_dir = Path.home() / ".codex/sessions"
+    try:
+        return any(base_dir.rglob(f"*{session_id}.jsonl"))
+    except OSError:
+        return False
+
+
+def claude_session_exists(session_id: str, cwd: object = None) -> bool:
+    base_dir = Path.home() / ".claude/projects"
+    if isinstance(cwd, str) and cwd:
+        project_path = base_dir / claude_project_name(cwd) / f"{session_id}.jsonl"
+        if project_path.exists():
+            return True
+
+    try:
+        return any(base_dir.rglob(f"{session_id}.jsonl"))
+    except OSError:
+        return False
+
+
+def claude_project_name(cwd: str) -> str:
+    return str(Path(cwd).expanduser().resolve()).replace(os.path.sep, "-")
+
+
+def incomplete_codex_resume_argv(restore_argv: list[str]) -> bool:
+    return restore_argv[:2] == ["codex", "resume"] and not any(
+        UUID_RE.fullmatch(part) for part in restore_argv[2:]
+    )
+
+
+def restore_argv_needs_user_shell(restore_argv: list[str]) -> bool:
+    return bool(restore_argv) and restore_argv[0] in ("codex", "claude")
+
+
+def call_restore_argv(restore_argv: list[str]) -> int:
+    if restore_argv_needs_user_shell(restore_argv):
+        shell = os.environ.get("SHELL") or "/bin/bash"
+        return subprocess.call([shell, "-ic", "exec " + shlex.join(restore_argv)])
+    return subprocess.call(restore_argv)
+
+
+def resume_candidate_lines(content: str):
+    lines = content.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        yield lines[index]
+        if index > 0:
+            yield " ".join(lines[index - 1 : index + 1])
+        if index > 1:
+            yield " ".join(lines[index - 2 : index + 1])
+
+
+def resume_argv_from_text(content: str, metadata: dict) -> list[str] | None:
+    for line in resume_candidate_lines(content):
+        match = CODEX_RESUME_RE.search(line)
+        if match:
+            restore_argv = ["codex", "resume", match.group("session_id")]
+            if restore_argv_session_available(restore_argv, metadata):
+                return restore_argv
+
+        match = CLAUDE_RESUME_RE.search(line)
+        if match:
+            restore_argv = ["claude", "--resume", match.group("session_id")]
+            if restore_argv_session_available(restore_argv, metadata):
+                return restore_argv
+    return None
+
+
+def resume_argv_from_transcript(pane_id: str, metadata: dict) -> list[str] | None:
+    transcript_path = transcript_path_from_metadata(
+        pane_id, metadata, "transcript_path", "txt"
+    )
+    try:
+        content = transcript_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+    return resume_argv_from_text(content, metadata)
+
+
+def choose_restore_argv(pane_id: str, metadata: dict) -> object:
     restore_argv = metadata.get("restore_argv")
+    metadata_has_specific_session = restore_argv_has_specific_session(
+        pane_id, restore_argv
+    )
+    if metadata_has_specific_session and restore_argv_session_available(
+        restore_argv, metadata
+    ):
+        return restore_argv
+
+    transcript_argv = resume_argv_from_transcript(pane_id, metadata)
+    if transcript_argv:
+        return transcript_argv
+    if metadata_has_specific_session:
+        return None
+    return restore_argv
+
+
+def restore_argv_uses_pane_id(pane_id: str, restore_argv: list[str]) -> bool:
+    if not pane_id or len(restore_argv) < 3 or restore_argv[-1] != pane_id:
+        return False
+    return restore_argv[:2] == ["codex", "resume"] or restore_argv[:2] == [
+        "claude",
+        "--resume",
+    ]
+
+
+def run_restore_command(pane_id: str, metadata: dict) -> None:
+    restore_argv = choose_restore_argv(pane_id, metadata)
     if not restore_argv:
         return
-    if not isinstance(restore_argv, list) or not all(
-        isinstance(part, str) for part in restore_argv
-    ):
+    if not valid_restore_argv(restore_argv):
         print("terminator-pane-restore: ignored invalid restore argv", file=sys.stderr)
+        return
+    if restore_argv_uses_pane_id(pane_id, restore_argv):
+        print(
+            "terminator-pane-restore: ignored restore argv that reused pane id",
+            file=sys.stderr,
+        )
+        return
+    if incomplete_codex_resume_argv(restore_argv):
+        print(
+            "terminator-pane-restore: ignored incomplete codex resume argv",
+            file=sys.stderr,
+        )
         return
 
     try:
-        subprocess.call(restore_argv)
+        call_restore_argv(restore_argv)
     except FileNotFoundError:
         print(
             f"terminator-pane-restore: command not found: {restore_argv[0]}",
@@ -59,17 +452,60 @@ def run_restore_command(metadata: dict) -> None:
         )
 
 
-def exec_shell() -> None:
+def shell_basename(shell: str) -> str:
+    return os.path.basename(shell).lstrip("-")
+
+
+def write_bash_history_rcfile(history_path: Path) -> Path:
+    rc_dir = state_dir() / BASH_HISTORY_RCDIR
+    rc_dir.mkdir(parents=True, exist_ok=True)
+    rc_path = rc_dir / f"{history_path.stem}.bashrc"
+
+    rc_path.write_text(
+        "\n".join(
+            [
+                "# Generated by terminator-pane-restore.",
+                "[ -r ~/.bashrc ] && . ~/.bashrc",
+                f"export HISTFILE={sh_quote(str(history_path))}",
+                "HISTSIZE=${HISTSIZE:-100000}",
+                "HISTFILESIZE=${HISTFILESIZE:-200000}",
+                "shopt -s histappend",
+                "__tasr_prompt_command=${PROMPT_COMMAND:-}",
+                "case \";$__tasr_prompt_command;\" in",
+                "  *';history -a;'*) ;;",
+                "  *) PROMPT_COMMAND=\"history -a; history -n${__tasr_prompt_command:+; $__tasr_prompt_command}\" ;;",
+                "esac",
+                "unset __tasr_prompt_command",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rc_path.chmod(0o600)
+    return rc_path
+
+
+def sh_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def exec_shell(pane_id: str) -> None:
     shell = os.environ.get("SHELL") or "/bin/bash"
+    history_path = configure_shell_history_env(pane_id)
+    if history_path is not None and shell_basename(shell) == "bash":
+        rc_path = write_bash_history_rcfile(history_path)
+        os.execlp(shell, shell, "--rcfile", str(rc_path), "-i")
     os.execlp(shell, shell, "-l")
 
 
 def main() -> None:
     pane_id = sys.argv[1] if len(sys.argv) > 1 else ""
     metadata = load_metadata(pane_id) if pane_id else {}
-    replay_transcript(pane_id, metadata)
-    run_restore_command(metadata)
-    exec_shell()
+    replayed, ended_with_newline = replay_transcript(pane_id, metadata)
+    if replayed:
+        print_live_shell_separator(ended_with_newline, metadata)
+    run_restore_command(pane_id, metadata)
+    exec_shell(pane_id)
 
 
 if __name__ == "__main__":
