@@ -21,29 +21,6 @@ The plugin does not require patching Terminator or replacing the Ubuntu
 - Claude Code sessions when a `claude --resume ...`, `claude -r ...`, or
   `claude --continue` restore target is detectable.
 
-## What It Cannot Restore
-
-This is not a generic process checkpoint system.
-
-After a normal reboot, Linux destroys each terminal's PTY, process memory, file
-descriptors, foreground jobs, and in-memory shell state. A terminal emulator
-cannot resume an arbitrary process such as `vim`, `ssh`, `python`, `npm run
-dev`, or an interactive shell exactly where it was unless that program has its
-own resume mechanism or it was running inside another persistence layer.
-
-For generic programs, this plugin restores the transcript and then starts a new
-shell. That means you see the previous commands and output in the pane, but the
-original process is not still alive.
-
-For exact continuation of arbitrary interactive programs, use one of these
-approaches instead or in addition:
-
-- Hibernate instead of rebooting.
-- Run work inside `tmux`, `zellij`, or `screen` and restore that multiplexer.
-- Use application-specific resume support, such as `codex resume` or
-  `claude --resume`.
-- Use CRIU-style checkpoint/restore for workloads that explicitly support it.
-
 ## Fresh Ubuntu Install
 
 These steps assume Ubuntu with GNOME and the stock Ubuntu `terminator` package.
