@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+layout_name="${TERMINATOR_AUTO_SESSION_LAYOUT:-TerminatorAutoSessionRestore}"
+config_home="${XDG_CONFIG_HOME:-"$HOME/.config"}"
+config_file="$config_home/terminator/config"
+
+run_plain() {
+  exec /usr/bin/terminator "$@"
+}
+
+if [ "${TERMINATOR_NO_AUTO_RESTORE:-}" = "1" ]; then
+  run_plain "$@"
+fi
+
+if [ "$#" -ne 0 ]; then
+  run_plain "$@"
+fi
+
+if pgrep -u "$(id -u)" -f '(^|[ /])terminator([ ]|$)' >/dev/null 2>&1; then
+  run_plain "$@"
+fi
+
+if [ -r "$config_file" ] &&
+   grep -Eq "^[[:space:]]*\\[\\[$layout_name\\]\\][[:space:]]*$" "$config_file"; then
+  exec /usr/bin/terminator -l "$layout_name"
+fi
+
+run_plain "$@"

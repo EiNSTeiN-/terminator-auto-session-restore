@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Replay one saved Terminator pane and start the best restore target."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / (
+        "terminator-auto-session"
+    )
+
+
+def load_metadata(pane_id: str) -> dict:
+    metadata_path = state_dir() / f"{pane_id}.json"
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        print(f"terminator-pane-restore: invalid metadata: {exc}", file=sys.stderr)
+        return {}
+
+
+def replay_transcript(pane_id: str, metadata: dict) -> None:
+    transcript_path = Path(
+        metadata.get("transcript_path") or state_dir() / f"{pane_id}.txt"
+    )
+    try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), ""):
+                sys.stdout.write(chunk)
+        sys.stdout.flush()
+    except FileNotFoundError:
+        return
+
+
+def run_restore_command(metadata: dict) -> None:
+    restore_argv = metadata.get("restore_argv")
+    if not restore_argv:
+        return
+    if not isinstance(restore_argv, list) or not all(
+        isinstance(part, str) for part in restore_argv
+    ):
+        print("terminator-pane-restore: ignored invalid restore argv", file=sys.stderr)
+        return
+
+    try:
+        subprocess.call(restore_argv)
+    except FileNotFoundError:
+        print(
+            f"terminator-pane-restore: command not found: {restore_argv[0]}",
+            file=sys.stderr,
+        )
+
+
+def exec_shell() -> None:
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    os.execlp(shell, shell, "-l")
+
+
+def main() -> None:
+    pane_id = sys.argv[1] if len(sys.argv) > 1 else ""
+    metadata = load_metadata(pane_id) if pane_id else {}
+    replay_transcript(pane_id, metadata)
+    run_restore_command(metadata)
+    exec_shell()
+
+
+if __name__ == "__main__":
+    main()
