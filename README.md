@@ -121,12 +121,16 @@ Terminator is running:
 
 - Layout, pane working directories, and Codex/Claude process-derived resume
   commands are refreshed periodically.
-- Plaintext transcript checkpoints are captured periodically for the full
-  available terminal scrollback, so the plugin does not intentionally truncate
-  saved transcript state.
+- Transcript capture and replay use the most recent 5000 rows per pane by
+  default. This keeps snapshot and restore work bounded so Terminator does not
+  pause noticeably on large scrollback buffers.
 - Styled HTML transcript capture is reserved for clean close, child exit,
   termination signal, or manual `Save Auto Session Now`, because HTML capture is
   the expensive path most likely to make typing feel sluggish.
+
+Set `TERMINATOR_AUTO_SESSION_TRANSCRIPT_ROWS` in Terminator's environment to
+change the row cap. Use a positive number for that many rows, or `0` to restore
+the old full-scrollback behavior.
 
 After a hard power loss, the latest checkpoint may be behind by one interval
 and the operating system may still lose very recent filesystem writes. The

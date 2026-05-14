@@ -34,6 +34,8 @@ except ImportError:
 AVAILABLE = ["TerminatorAutoSessionRestore"]
 
 LAYOUT_NAME = "TerminatorAutoSessionRestore"
+TRANSCRIPT_ROWS_ENV = "TERMINATOR_AUTO_SESSION_TRANSCRIPT_ROWS"
+DEFAULT_TRANSCRIPT_MAX_ROWS = 5000
 SAVE_INTERVAL_SECONDS = 20
 TRANSCRIPT_CHECKPOINT_INTERVAL_SECONDS = 60
 CONNECT_INTERVAL_SECONDS = 2
@@ -76,6 +78,19 @@ CODEX_SESSION_PATH_MARKERS = (
     "/.codex/sessions/",
 )
 RECENT_SESSION_SCAN_LIMIT = 80
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+TRANSCRIPT_MAX_ROWS = _env_int(TRANSCRIPT_ROWS_ENV, DEFAULT_TRANSCRIPT_MAX_ROWS)
 
 
 class TerminatorAutoSessionRestore(plugin.MenuItem):
@@ -590,6 +605,7 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         html_transcript_path = os.path.join(STATE_DIR, "%s.html" % pane_id)
         metadata_path = os.path.join(STATE_DIR, "%s.json" % pane_id)
 
+        transcript = None
         html_transcript = None
         if capture_mode != CAPTURE_NONE:
             transcript, html_transcript = self._capture_scrollback(terminal, capture_mode)
@@ -606,6 +622,8 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             "restore_argv": restore_argv,
             "transcript_path": transcript_path,
         }
+        if capture_mode != CAPTURE_NONE and transcript is not None:
+            metadata["transcript_max_rows"] = TRANSCRIPT_MAX_ROWS
         if self._should_use_html_transcript(
             html_transcript_path, transcript_path, capture_mode, html_transcript
         ):
@@ -639,8 +657,10 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         try:
             vte_terminal = terminal.get_vte()
             col, row = vte_terminal.get_cursor_position()
-            row_start = 0
             row_end = max(row, 0)
+            row_start = 0
+            if TRANSCRIPT_MAX_ROWS > 0:
+                row_start = max(0, row_end - TRANSCRIPT_MAX_ROWS)
             if Vte.get_minor_version() < 72:
                 text = vte_terminal.get_text_range(
                     row_start, 0, row_end, col, lambda *args: True

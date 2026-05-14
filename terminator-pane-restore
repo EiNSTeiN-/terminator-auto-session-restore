@@ -10,12 +10,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections import deque
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
 
 SEPARATOR_FALLBACK_LABEL = " previous shell ended; live shell below "
+TRANSCRIPT_ROWS_ENV = "TERMINATOR_AUTO_SESSION_TRANSCRIPT_ROWS"
+DEFAULT_TRANSCRIPT_MAX_ROWS = 5000
 ANSI_RESET = "\033[0m"
 ANSI_PATTERN = re.compile(r"\033\[[0-9;]*m")
 RGB_PATTERN = re.compile(r"rgba?\(([^)]+)\)")
@@ -44,6 +47,19 @@ HTML_COLOR_NAMES = {
     "gray": (128, 128, 128),
     "grey": (128, 128, 128),
 }
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+TRANSCRIPT_MAX_ROWS = env_int(TRANSCRIPT_ROWS_ENV, DEFAULT_TRANSCRIPT_MAX_ROWS)
 
 
 def state_dir() -> Path:
@@ -92,26 +108,62 @@ def transcript_path_from_metadata(pane_id: str, metadata: dict, key: str, suffix
     return Path(metadata.get(key) or state_dir() / f"{pane_id}.{suffix}")
 
 
-def replay_transcript(pane_id: str, metadata: dict) -> tuple[bool, bool]:
-    html_transcript_path = transcript_path_from_metadata(
-        pane_id, metadata, "html_transcript_path", "html"
-    )
+def html_transcript_matches_row_limit(metadata: dict) -> bool:
+    if TRANSCRIPT_MAX_ROWS <= 0:
+        return True
+    saved_limit = metadata.get("transcript_max_rows")
     try:
-        html_transcript = html_transcript_path.read_text(
-            encoding="utf-8", errors="replace"
+        saved_limit = int(saved_limit)
+    except (TypeError, ValueError):
+        return False
+    return 0 < saved_limit <= TRANSCRIPT_MAX_ROWS
+
+
+def replay_transcript(pane_id: str, metadata: dict) -> tuple[bool, bool]:
+    if html_transcript_matches_row_limit(metadata):
+        html_transcript_path = transcript_path_from_metadata(
+            pane_id, metadata, "html_transcript_path", "html"
         )
-    except FileNotFoundError:
-        html_transcript = ""
-    if html_transcript:
-        transcript = html_to_ansi(html_transcript)
-        if transcript:
-            sys.stdout.write(transcript)
-            sys.stdout.flush()
-            return True, transcript.endswith("\n")
+        try:
+            html_transcript = html_transcript_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except FileNotFoundError:
+            html_transcript = ""
+        if html_transcript:
+            transcript = html_to_ansi(html_transcript)
+            if transcript:
+                sys.stdout.write(transcript)
+                sys.stdout.flush()
+                return True, transcript.endswith("\n")
 
     transcript_path = transcript_path_from_metadata(
         pane_id, metadata, "transcript_path", "txt"
     )
+    if TRANSCRIPT_MAX_ROWS > 0:
+        return replay_limited_text_transcript(transcript_path)
+    return replay_full_text_transcript(transcript_path)
+
+
+def replay_limited_text_transcript(transcript_path: Path) -> tuple[bool, bool]:
+    lines: deque[str] = deque(maxlen=TRANSCRIPT_MAX_ROWS)
+    try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                lines.append(line)
+    except FileNotFoundError:
+        return False, True
+
+    if not lines:
+        return False, True
+
+    transcript = "".join(lines)
+    sys.stdout.write(transcript)
+    sys.stdout.flush()
+    return True, transcript.endswith("\n")
+
+
+def replay_full_text_transcript(transcript_path: Path) -> tuple[bool, bool]:
     wrote_transcript = False
     ended_with_newline = True
     try:
