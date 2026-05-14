@@ -50,8 +50,22 @@ def ensure_plugin_enabled(config_path: Path) -> None:
     if PLUGIN_NAME not in enabled:
         enabled.append(PLUGIN_NAME)
     config["global_config"]["enabled_plugins"] = enabled
+
+    layouts = config.get("layouts", {})
+    if PLUGIN_NAME in layouts and not layout_has_terminal(layouts[PLUGIN_NAME]):
+        del layouts[PLUGIN_NAME]
+
     config.indent_type = "  "
     config.write()
+
+
+def layout_has_terminal(layout: object) -> bool:
+    if not isinstance(layout, dict):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "Terminal"
+        for item in layout.values()
+    )
 
 
 def desktop_file_lines(name: str, comment: str, wrapper: Path) -> list[str]:

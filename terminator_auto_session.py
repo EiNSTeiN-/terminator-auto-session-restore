@@ -289,10 +289,10 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
 
     def _save_on_window_delete(self, _window, _event):
         terminal_count = self._terminal_count()
+        self._mark_window_close_snapshot(terminal_count)
         self.save_session_layout(
             force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
         )
-        self._mark_window_close_snapshot(terminal_count)
         return False
 
     def _save_on_pre_close(self, _terminal, *_args):
@@ -300,11 +300,10 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         if self._should_skip_degraded_close_save(terminal_count):
             return
 
+        self._mark_window_close_snapshot(terminal_count)
         self.save_session_layout(
             force=True, capture_mode=CAPTURE_FULL, include_scrollback_resume=True
         )
-        if terminal_count > 1:
-            self._mark_window_close_snapshot(terminal_count)
 
     def _save_on_close_term(self, _terminal, *_args):
         if self._should_skip_degraded_close_save():
@@ -388,6 +387,9 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
             current_layout = self._normalise_layout_for_config(
                 terminator.describe_layout(save_cwd=False)
             )
+            if self._layout_terminal_count(current_layout) < 1:
+                dbg("%s skipped layout save with no terminals" % LAYOUT_NAME)
+                return True
             self._add_restore_state(
                 current_layout, capture_mode, include_scrollback_resume
             )
@@ -412,6 +414,13 @@ class TerminatorAutoSessionRestore(plugin.MenuItem):
         except Exception as ex:
             err("%s failed to save layout: %s" % (LAYOUT_NAME, ex))
         return True
+
+    def _layout_terminal_count(self, layout):
+        return sum(
+            1
+            for item in layout.values()
+            if isinstance(item, dict) and item.get("type") == "Terminal"
+        )
 
     def _add_restore_state(self, layout, capture_mode, include_scrollback_resume):
         terminals_by_uuid = {

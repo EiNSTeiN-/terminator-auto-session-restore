@@ -10,6 +10,20 @@ run_plain() {
   exec /usr/bin/terminator "$@"
 }
 
+saved_layout_has_terminal() {
+  awk -v layout_name="$layout_name" '
+    /^[[:space:]]*\[\[[^[]/ {
+      in_layout = ($0 ~ "^[[:space:]]*\\[\\[" layout_name "\\]\\][[:space:]]*$")
+    }
+    in_layout && /^[[:space:]]*type[[:space:]]*=[[:space:]]*Terminal[[:space:]]*$/ {
+      found = 1
+    }
+    END {
+      exit(found ? 0 : 1)
+    }
+  ' "$config_file"
+}
+
 if [ "${TERMINATOR_NO_AUTO_RESTORE:-}" = "1" ]; then
   run_plain "$@"
 fi
@@ -23,8 +37,7 @@ if [ "$force_restore" != "1" ] &&
   run_plain "$@"
 fi
 
-if [ -r "$config_file" ] &&
-   grep -Eq "^[[:space:]]*\\[\\[$layout_name\\]\\][[:space:]]*$" "$config_file"; then
+if [ -r "$config_file" ] && saved_layout_has_terminal; then
   if [ "$force_restore" = "1" ]; then
     exec /usr/bin/terminator -u -l "$layout_name"
   fi
